@@ -17,13 +17,16 @@ if err != nil {
 defer mc.Close(context.Background())
 
 // In auth middleware, on every request where the user is known:
-mc.Signup(motif.Signup{UserID: user.ID, CreatedAt: user.CreatedAt, OptedOut: user.AnalyticsConsent == "denied"})
+mc.Signup(motif.Signup{UserID: user.ID, CreatedAt: user.CreatedAt, Declined: user.AnalyticsConsent == "denied", OptedOut: user.IsStaff})
 ```
 
 `Signup` returns at once and never blocks or fails a request. The first call
 for a user sends `signup_completed` in the background; later calls cost
 nothing. Failed sends retry on a later request, so a missed branch, late
-consent or a restart heals by itself. `OptedOut` users are never sent.
+consent or a restart heals by itself. `Declined` users (they said no to
+analytics) are sent only as a count: no user id, just that a signup happened
+that day, with a retry token Motif cannot reverse and deletes after 48 hours.
+`OptedOut` users (staff, test accounts) are never sent.
 
 Also: `mc.Milestone(ctx, motif.Milestone{...})` for other milestones,
 `mc.Backfill(ctx, users)` to send past signups once, `mc.Stats()`,

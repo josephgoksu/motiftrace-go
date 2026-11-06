@@ -626,13 +626,204 @@ func TestSignupOptedOutSendsNothing(t *testing.T) {
 	if d := c.Signup(Signup{UserID: "u1", CreatedAt: time.Now(), OptedOut: true}); d != OptedOut {
 		t.Fatalf("decision = %q, want %q", d, OptedOut)
 	}
+	rep, err := c.Backfill(context.Background(), []Signup{{UserID: "u2", CreatedAt: time.Now(), OptedOut: true}})
+	if err != nil || rep.OptedOut != 1 || rep.Eligible != 0 {
+		t.Fatalf("backfill opted out: rep=%+v err=%v", rep, err)
+	}
 	if err := c.Flush(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if hits != 0 {
 		t.Fatalf("sent %d requests for an opted-out user", hits)
 	}
-	if got := c.Stats().Skipped[OptedOut]; got != 1 {
-		t.Fatalf("Skipped[OptedOut] = %d, want 1", got)
+	if got := c.Stats().Skipped[OptedOut]; got != 2 {
+		t.Fatalf("Skipped[OptedOut] = %d, want 2", got)
+	}
+}
+
+func TestMilestoneValidatesInputsTrimsBOMAndHonoursDisabledState(t *testing.T) {
+	var hits int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = w.Write([]byte(`{"code":"UNAUTHORIZED","message":"bad key"}`))
+	}))
+	defer srv.Close()
+	c := client(t, srv.URL, Config{Retries: 100}) // large Retries is clamped, never overflows
+	if d := c.Signup(Signup{UserID: "\uFEFF", CreatedAt: time.Now()}); d != Invalid {
+		t.Fatalf("BOM-only UserID decision = %q, want %q", d, Invalid)
+	}
+	for _, m := range []Milestone{
+		{UserID: " \uFEFF ", EventName: "x"},
+		{UserID: "u1", EventName: " "},
+	} {
+		_, err := c.Milestone(context.Background(), m)
+		var me *Error
+		if !errors.As(err, &me) || me.Code != "INVALID" {
+			t.Fatalf("Milestone(%+v) err = %v, want INVALID", m, err)
+		}
+	}
+	if hits != 0 {
+		t.Fatalf("sent %d requests for invalid milestones", hits)
+	}
+	// First valid call hits 401 and disables the client; second call fails fast with CONFIG.
+	if _, err := c.Milestone(context.Background(), Milestone{UserID: "u1", EventName: "x"}); err == nil {
+		t.Fatal("expected 401 error")
+	}
+	_, err := c.Milestone(context.Background(), Milestone{UserID: "u1", EventName: "x"})
+	var me *Error
+	if !errors.As(err, &me) || me.Code != "CONFIG" || hits != 1 {
+		t.Fatalf("second Milestone after 401: err=%v hits=%d", err, hits)
+	}
+}
+
+// A declined user is counted with no user id: the body carries only the site,
+// a token Motif cannot reverse, and the signup's day. Sent once, and only
+// within a day of the signup.
+func TestSignupDeclinedSendsACountWithoutTheUserID(t *testing.T) {
+	rec := &recorder{}
+	var paths []string
+	var pmu sync.Mutex
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		pmu.Lock()
+		paths = append(paths, req.URL.Path)
+		pmu.Unlock()
+		raw, _ := io.ReadAll(req.Body)
+		var b map[string]any
+		_ = json.Unmarshal(raw, &b)
+		rec.mu.Lock()
+		rec.bodies = append(rec.bodies, b)
+		rec.mu.Unlock()
+		if bytes.Contains(raw, []byte("u-declined")) {
+			t.Errorf("user id left the server: %s", raw)
+		}
+		_, _ = w.Write([]byte(`{"status":"counted"}`))
+	}))
+	t.Cleanup(srv.Close)
+	c := client(t, srv.URL, Config{})
+	created := time.Now().Add(-time.Hour).Truncate(time.Second)
+	if d := c.Signup(Signup{UserID: "u-declined", CreatedAt: created, Declined: true}); d != Queued {
+		t.Fatalf("first %s", d)
+	}
+	flush(t, c)
+	if d := c.Signup(Signup{UserID: "u-declined", CreatedAt: created, Declined: true}); d != Known {
+		t.Fatalf("after ack %s", d)
+	}
+	if d := c.Signup(Signup{UserID: "u-old", CreatedAt: time.Now().Add(-25 * time.Hour), Declined: true}); d != TooOld {
+		t.Fatalf("a day late %s", d)
+	}
+	if d := c.Signup(Signup{UserID: "u-staff", CreatedAt: created, Declined: true, OptedOut: true}); d != OptedOut {
+		t.Fatalf("opted out wins %s", d)
+	}
+	flush(t, c)
+	if rec.count() != 1 || paths[0] != "/v1/milestones/declined" {
+		t.Fatalf("requests %d paths %v", rec.count(), paths)
+	}
+	b := rec.bodies[0]
+	tok, _ := b["token"].(string)
+	if b["website_id"] != site || len(tok) != 64 || tok != declinedToken("mtk_test_k", site, "u-declined") || b["user_id"] != nil {
+		t.Fatalf("body %v", b)
+	}
+	if at, _ := time.Parse(time.RFC3339, b["occurred_at"].(string)); !at.Equal(created) {
+		t.Fatalf("occurred_at %v, want CreatedAt %s", b["occurred_at"], created)
+	}
+	if c.Stats().Counted != 1 {
+		t.Fatalf("stats %+v", c.Stats())
+	}
+}
+
+// A user this process already sent with their id, who declines afterwards,
+// is not counted a second time.
+func TestSignupDeclinedAfterAnIdentifiedSendIsKnown(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, func(_ int, w http.ResponseWriter) { _, _ = w.Write([]byte(`{"status":"pending"}`)) })
+	c := client(t, srv.URL, Config{})
+	created := time.Now().Add(-time.Minute)
+	c.Signup(Signup{UserID: "u1", CreatedAt: created})
+	flush(t, c)
+	if d := c.Signup(Signup{UserID: "u1", CreatedAt: created, Declined: true}); d != Known {
+		t.Fatalf("declined after send %s", d)
+	}
+	flush(t, c)
+	if rec.count() != 1 {
+		t.Fatalf("requests %d", rec.count())
+	}
+}
+
+func TestBackfillSendsDeclinedUsersAsCounts(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, func(n int, w http.ResponseWriter) {
+		if n == 1 {
+			_, _ = w.Write([]byte(`{"status":"counted"}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"status":"pending"}`))
+	})
+	c := client(t, srv.URL, Config{BackfillRate: 1000})
+	at := time.Now().AddDate(0, 0, -3).Truncate(time.Second)
+	rep, err := c.Backfill(context.Background(), []Signup{{UserID: "d", CreatedAt: at, Declined: true}, {UserID: "p", CreatedAt: at}})
+	if err != nil || rep.Sent.Counted != 1 || rep.Sent.Pending != 1 || rep.Eligible != 2 {
+		t.Fatalf("rep %+v err %v", rep, err)
+	}
+	if _, ok := rec.bodies[0]["user_id"]; ok || rec.bodies[0]["token"] == nil {
+		t.Fatalf("declined body %v", rec.bodies[0])
+	}
+}
+
+// A user counted as declined who accepts afterwards is not counted a second
+// time with their id, and a declined call while the identified send is still
+// queued is not counted either.
+func TestSignupCountsAUserOnceAcrossDeclinedAndIdentified(t *testing.T) {
+	rec := &recorder{}
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock() // a failed check must not leave the server's handler waiting
+	srv := rec.serve(t, func(n int, w http.ResponseWriter) {
+		if n == 2 {
+			<-release
+		}
+		_, _ = w.Write([]byte(`{"status":"counted"}`))
+	})
+	c := client(t, srv.URL, Config{})
+	created := time.Now().Add(-time.Minute)
+	c.Signup(Signup{UserID: "d1", CreatedAt: created, Declined: true})
+	flush(t, c)
+	if d := c.Signup(Signup{UserID: "d1", CreatedAt: created}); d != Known {
+		t.Fatalf("identified after declined %s", d)
+	}
+	if d := c.Signup(Signup{UserID: "i1", CreatedAt: created}); d != Queued {
+		t.Fatalf("identified %s", d)
+	}
+	if d := c.Signup(Signup{UserID: "i1", CreatedAt: created, Declined: true}); d != Known {
+		t.Fatalf("declined while the identified send is queued %s", d)
+	}
+	unblock()
+	flush(t, c)
+	if rec.count() != 2 {
+		t.Fatalf("requests %d", rec.count())
+	}
+}
+
+// A CreatedAt ahead of this clock is sent as now, never as a future time
+// Motif would refuse.
+func TestSignupDeclinedClampsAFutureCreatedAt(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, func(_ int, w http.ResponseWriter) { _, _ = w.Write([]byte(`{"status":"counted"}`)) })
+	c := client(t, srv.URL, Config{})
+	before := time.Now()
+	c.Signup(Signup{UserID: "u1", CreatedAt: before.Add(time.Hour), Declined: true})
+	flush(t, c)
+	at, err := time.Parse(time.RFC3339Nano, rec.bodies[0]["occurred_at"].(string))
+	if err != nil || at.After(time.Now()) || at.Before(before) {
+		t.Fatalf("occurred_at %v (err %v)", rec.bodies[0]["occurred_at"], err)
+	}
+}
+
+// sdk/test/server.test.ts pins the same vector, so both SDKs drop each
+// other's retries.
+func TestDeclinedTokenMatchesTheTSSDK(t *testing.T) {
+	if got := declinedToken("k", "s", "u"); got != "773396da09413482392765e80c768e96a0319c223c988ec4a2c38ae83ed9ab06" {
+		t.Fatalf("token %s", got)
 	}
 }

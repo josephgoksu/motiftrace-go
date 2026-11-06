@@ -28,6 +28,9 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -41,6 +44,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 // DefaultBaseURL is Motif's hosted API.
@@ -56,6 +60,8 @@ const (
 	Pending Status = "pending"
 	// Duplicate: already received; nothing changed.
 	Duplicate Status = "duplicate"
+	// Counted: a declined signup, counted with no person behind it.
+	Counted Status = "counted"
 )
 
 // Milestone is one event for one of your users.
@@ -88,7 +94,15 @@ type Signup struct {
 	// declined, or your app records Global Privacy Control as a decline).
 	// Nothing is sent; Stats().Skipped[OptedOut] counts it. Undecided users
 	// are not opted out: a server signup stores nothing on their device.
+	// OptedOut wins over Declined: use it for staff and test accounts too.
 	OptedOut bool
+	// Declined is true when the user declined analytics and you still want
+	// the signup counted. The user id never leaves your server: Motif gets
+	// only that a signup happened at CreatedAt, plus a retry token
+	// (HMAC-SHA256 of the user id under your ingest key) that it clears after
+	// 48 hours. Sent only within 24 hours of CreatedAt, so a signup counts on
+	// its day; the Overview estimates its channel from your tracked signups.
+	Declined bool
 }
 
 // Decision is what Signup did, synchronously.
@@ -118,11 +132,12 @@ const (
 
 // Result is one finished send, background or awaited.
 type Result struct {
-	Kind      string // "signup", "milestone" or "backfill"
+	Kind      string // "signup", "declined", "milestone" or "backfill"
 	WebsiteID string
 	UserID    string
 	EventName string
-	// Outcome is "attached", "pending", "duplicate", "failed" or "dropped".
+	// Outcome is "attached", "pending", "counted" (a declined signup),
+	// "duplicate", "failed" or "dropped".
 	Outcome string
 	Reason  string // set when Outcome is "failed"
 	Err     error
@@ -132,6 +147,7 @@ type Result struct {
 type Stats struct {
 	Queued                       int
 	Attached, Pending, Duplicate int64
+	Counted                      int64 // declined signups counted
 	Dropped                      int64
 	Failed                       map[string]int64 // by Reason*
 	Skipped                      map[Decision]int64
@@ -210,8 +226,14 @@ type Config struct {
 }
 
 const (
-	signupEvent     = "signup_completed"
-	milestonesPath  = "/v1/milestones"
+	signupEvent    = "signup_completed"
+	milestonesPath = "/v1/milestones"
+	declinedPath   = "/v1/milestones/declined"
+	// declinedSuffix turns a user's signup key into their declined count's key.
+	declinedSuffix = "\x00declined"
+	// declinedWindow is how long after CreatedAt a declined signup is sent.
+	// Motif keeps its retry token 48 hours, so a later resend could count twice.
+	declinedWindow  = 24 * time.Hour
 	failureBackoff  = time.Minute
 	maxSignupWindow = 90 * 24 * time.Hour
 	// BackfillWindow is how far back Motif accepts an occurred_at
@@ -282,7 +304,7 @@ type Client struct {
 // id comes from $MOTIF_WEBSITE_ID or each call.
 func New(apiKey string) *Client {
 	c, _ := NewClient(Config{APIKey: apiKey})
-	if strings.TrimSpace(apiKey) == "" {
+	if trimSpace(apiKey) == "" {
 		// New was always given its key; do not fall back to the environment.
 		c.apiKey, c.disabled = "", "no key"
 	}
@@ -293,19 +315,19 @@ func New(apiKey string) *Client {
 // cfg.Strict is set and the configuration is missing or malformed; otherwise
 // it logs the problem once and returns a client whose sends are off.
 func NewClient(cfg Config) (*Client, error) {
-	key := strings.TrimSpace(cfg.APIKey)
+	key := trimSpace(cfg.APIKey)
 	if key == "" {
-		key = strings.TrimSpace(os.Getenv("MOTIF_INGEST_KEY"))
+		key = trimSpace(os.Getenv("MOTIF_INGEST_KEY"))
 	}
-	site := strings.TrimSpace(cfg.WebsiteID)
+	site := trimSpace(cfg.WebsiteID)
 	if site == "" {
-		site = strings.TrimSpace(os.Getenv("MOTIF_WEBSITE_ID"))
+		site = trimSpace(os.Getenv("MOTIF_WEBSITE_ID"))
 	}
 	c := &Client{
 		apiKey:    key,
 		BaseURL:   orString(cfg.BaseURL, DefaultBaseURL),
 		HTTP:      cfg.HTTP,
-		Retries:   cfg.Retries,
+		Retries:   min(cfg.Retries, 10),
 		websiteID: site,
 		timeout:   orDuration(cfg.Timeout, 5*time.Second),
 		deadline:  orDuration(cfg.Deadline, 10*time.Second),
@@ -384,8 +406,8 @@ func (c *Client) signupLocked(s Signup, now time.Time) (Decision, job) {
 	if c.closed || c.disabled != "" {
 		return Disabled, job{}
 	}
-	site := orString(strings.TrimSpace(s.WebsiteID), c.websiteID)
-	user := strings.TrimSpace(s.UserID)
+	site := orString(trimSpace(s.WebsiteID), c.websiteID)
+	user := trimSpace(s.UserID)
 	if site == "" || user == "" || s.CreatedAt.IsZero() {
 		c.onceLocked(slog.LevelError, "signup:invalid", "motif: Signup needs a UserID, a CreatedAt, and a website id (Config.WebsiteID or MOTIF_WEBSITE_ID)")
 		return Invalid, job{}
@@ -397,34 +419,104 @@ func (c *Client) signupLocked(s Signup, now time.Time) (Decision, job) {
 		return TooOld, job{}
 	}
 	key := site + "\x00" + user + "\x00" + signupEvent
-	if c.inQueue[key] {
+	if s.Declined {
+		return c.declinedLocked(s, site, user, key, now)
+	}
+	// Counted already as declined (they accepted after declining): not again.
+	if c.countedLocked(key + declinedSuffix) {
 		return Known, job{}
+	}
+	if d := c.seenLocked(key, now); d != "" {
+		return d, job{}
+	}
+	body, _ := json.Marshal(request{WebsiteID: site, UserID: user, EventName: signupEvent, OccurredAt: utcOrNil(s.OccurredAt)})
+	return Queued, job{kind: "signup", key: key, path: milestonesPath, websiteID: site, userID: user, name: signupEvent, body: body}
+}
+
+// declinedLocked queues the anonymous count for a user who declined. A user
+// this process already queued or sent with their id (they declined after
+// signing up) is not counted again.
+func (c *Client) declinedLocked(s Signup, site, user, signupKey string, now time.Time) (Decision, job) {
+	if now.Sub(s.CreatedAt) > declinedWindow {
+		return TooOld, job{}
+	}
+	if c.countedLocked(signupKey) {
+		return Known, job{}
+	}
+	key := signupKey + declinedSuffix
+	if d := c.seenLocked(key, now); d != "" {
+		return d, job{}
+	}
+	// A CreatedAt ahead of this clock would be refused past Motif's skew
+	// allowance; an event never lands in the future.
+	at := s.CreatedAt
+	if at.After(now) {
+		at = now
+	}
+	at = at.UTC()
+	body, _ := json.Marshal(declinedRequest{WebsiteID: site, Token: declinedToken(c.apiKey, site, user), OccurredAt: &at})
+	return Queued, job{kind: "declined", key: key, path: declinedPath, websiteID: site, userID: user, name: signupEvent, body: body}
+}
+
+// countedLocked reports whether key is queued or acknowledged, so the same
+// user's signup in the other form (with their id, or declined) is not counted
+// a second time.
+func (c *Client) countedLocked(key string) bool {
+	if c.inQueue[key] {
+		return true
+	}
+	el, ok := c.cache[key]
+	return ok && el.Value.(*entry).ok
+}
+
+// seenLocked answers Known or Backoff for a key that is queued or remembered,
+// and "" when it should be sent.
+func (c *Client) seenLocked(key string, now time.Time) Decision {
+	if c.inQueue[key] {
+		return Known
 	}
 	if el, ok := c.cache[key]; ok {
 		e := el.Value.(*entry)
 		if now.Before(e.until) {
 			c.lru.MoveToFront(el)
 			if e.ok {
-				return Known, job{}
+				return Known
 			}
-			return Backoff, job{}
+			return Backoff
 		}
 		c.lru.Remove(el)
 		delete(c.cache, key)
 	}
-	body, _ := json.Marshal(request{WebsiteID: site, UserID: user, EventName: signupEvent, OccurredAt: utcOrNil(s.OccurredAt)})
-	return Queued, job{kind: "signup", key: key, path: milestonesPath, websiteID: site, userID: user, name: signupEvent, body: body}
+	return ""
 }
 
 // Milestone sends m and waits for Motif's answer, at most Config.Deadline.
 // Never fail a user's request over it: log the error.
 func (c *Client) Milestone(ctx context.Context, m Milestone) (Status, error) {
-	site := orString(strings.TrimSpace(m.WebsiteID), c.websiteID)
-	body, err := json.Marshal(request{WebsiteID: site, UserID: m.UserID, EventName: m.EventName, OccurredAt: utcOrNil(m.OccurredAt), DedupeKey: m.DedupeKey})
+	site := orString(trimSpace(m.WebsiteID), c.websiteID)
+	user := trimSpace(m.UserID)
+	event := trimSpace(m.EventName)
+	dedupe := trimSpace(m.DedupeKey)
+	c.mu.Lock()
+	off := c.disabled
+	switch {
+	case off == "" && c.closed:
+		off = "closed"
+	case off == "" && site != "" && c.deadSites[site]:
+		off = "unknown website"
+	}
+	c.mu.Unlock()
+	if off != "" {
+		return "", &Error{Code: "CONFIG", Message: "sends are off (" + off + ")"}
+	}
+	if site == "" || user == "" || event == "" {
+		return "", &Error{Code: "INVALID", Message: "Milestone needs a WebsiteID, UserID, and EventName"}
+	}
+	body, err := json.Marshal(request{WebsiteID: site, UserID: user, EventName: event, OccurredAt: utcOrNil(m.OccurredAt), DedupeKey: dedupe})
 	if err != nil {
 		return "", err
 	}
-	res := Result{Kind: "milestone", WebsiteID: site, UserID: m.UserID, EventName: m.EventName}
+	res := Result{Kind: "milestone", WebsiteID: site, UserID: user, EventName: event}
 	status, err := c.post(ctx, milestonesPath, body)
 	if err != nil {
 		var me *Error
@@ -443,10 +535,13 @@ func (c *Client) Milestone(ctx context.Context, m Milestone) (Status, error) {
 type BackfillSent struct {
 	Attached int `json:"attached"`
 	Pending  int `json:"pending"`
+	// Counted: declined users, sent as a count with no user id.
+	Counted int `json:"counted,omitempty"`
 }
 
 // BackfillReport is what Backfill did. Every user lands in exactly one
-// bucket: Sent, Duplicate, TooOld, Invalid or one Failed reason.
+// bucket: Sent, Duplicate, TooOld, Invalid, OptedOut or one Failed reason.
+// Declined users are sent as counts (Sent.Counted).
 type BackfillReport struct {
 	Total int `json:"total"`
 	// Eligible users were valid, inside the window, and not repeated in the input.
@@ -458,8 +553,10 @@ type BackfillReport struct {
 	// TooOld: created longer ago than BackfillWindow.
 	TooOld int `json:"too_old"`
 	// Invalid: empty UserID, zero CreatedAt, a CreatedAt in the future, or no website id.
-	Invalid int            `json:"invalid"`
-	Failed  map[string]int `json:"failed"`
+	Invalid int `json:"invalid"`
+	// OptedOut: users with OptedOut set to true (never sent).
+	OptedOut int            `json:"opted_out,omitempty"`
+	Failed   map[string]int `json:"failed"`
 }
 
 // Backfill repairs history: it sends signup_completed for each past account,
@@ -483,8 +580,15 @@ func (c *Client) Backfill(ctx context.Context, users []Signup) (BackfillReport, 
 		if err := ctx.Err(); err != nil {
 			return out, err
 		}
-		site := orString(strings.TrimSpace(u.WebsiteID), c.websiteID)
-		user := strings.TrimSpace(u.UserID)
+		if u.OptedOut {
+			c.mu.Lock()
+			c.stats.Skipped[OptedOut]++
+			c.mu.Unlock()
+			out.OptedOut++
+			continue
+		}
+		site := orString(trimSpace(u.WebsiteID), c.websiteID)
+		user := trimSpace(u.UserID)
 		now := time.Now()
 		key := site + "\x00" + user + "\x00" + signupEvent
 		switch {
@@ -500,7 +604,7 @@ func (c *Client) Backfill(ctx context.Context, users []Signup) (BackfillReport, 
 		}
 		seen[key] = true
 		out.Eligible++
-		res, err := c.sendBackfill(ctx, key, site, user, u.CreatedAt, time.Until(next))
+		res, err := c.sendBackfill(ctx, backfillJob(c.apiKey, key, site, user, u), time.Until(next))
 		if err != nil {
 			return out, err
 		}
@@ -510,6 +614,8 @@ func (c *Client) Backfill(ctx context.Context, users []Signup) (BackfillReport, 
 			out.Sent.Attached++
 		case string(Pending):
 			out.Sent.Pending++
+		case string(Counted):
+			out.Sent.Counted++
 		case string(Duplicate):
 			out.Duplicate++
 		default:
@@ -519,13 +625,35 @@ func (c *Client) Backfill(ctx context.Context, users []Signup) (BackfillReport, 
 	return out, nil
 }
 
+// backfillJob is the send for one past signup, dated CreatedAt: with the
+// user id, or for a declined user only the count (see Signup.Declined).
+// Motif drops a repeated declined count for 48 hours only, so re-running a
+// backfill of declined users later counts them again.
+func backfillJob(apiKey, key, site, user string, u Signup) job {
+	if u.Declined {
+		at := u.CreatedAt.UTC()
+		body, _ := json.Marshal(declinedRequest{WebsiteID: site, Token: declinedToken(apiKey, site, user), OccurredAt: &at})
+		return job{kind: "backfill", key: key + declinedSuffix, path: declinedPath, websiteID: site, userID: user, name: signupEvent, body: body, done: make(chan Result, 1)}
+	}
+	body, _ := json.Marshal(request{WebsiteID: site, UserID: user, EventName: signupEvent, OccurredAt: utcOrNil(u.CreatedAt)})
+	return job{kind: "backfill", key: key, path: milestonesPath, websiteID: site, userID: user, name: signupEvent, body: body, done: make(chan Result, 1)}
+}
+
+// declinedToken is the retry token for a declined signup: HMAC-SHA256 of the
+// user id under the ingest key, which Motif stores only as a hash, so Motif
+// cannot recompute or reverse it.
+func declinedToken(apiKey, site, user string) string {
+	mac := hmac.New(sha256.New, []byte(apiKey))
+	mac.Write([]byte(site + "\x00" + user))
+	return hex.EncodeToString(mac.Sum(nil))
+}
+
 // sendBackfill puts one backfill send on the shared queue and waits for it.
 // A user this process already got acknowledged is a duplicate with no
 // request, and one whose sends are off fails at once: neither waits out the
 // pace, so a refused key ends the run instead of pacing through every user.
-func (c *Client) sendBackfill(ctx context.Context, key, site, user string, at time.Time, wait time.Duration) (Result, error) {
-	body, _ := json.Marshal(request{WebsiteID: site, UserID: user, EventName: signupEvent, OccurredAt: utcOrNil(at)})
-	j := job{kind: "backfill", key: key, path: milestonesPath, websiteID: site, userID: user, name: signupEvent, body: body, done: make(chan Result, 1)}
+func (c *Client) sendBackfill(ctx context.Context, j job, wait time.Duration) (Result, error) {
+	key, site, user := j.key, j.websiteID, j.userID
 	paced := wait <= 0
 	for {
 		c.mu.Lock()
@@ -738,6 +866,8 @@ func (c *Client) report(r Result) {
 		c.stats.Pending++
 	case string(Duplicate):
 		c.stats.Duplicate++
+	case string(Counted):
+		c.stats.Counted++
 	case "dropped":
 		c.stats.Dropped++
 	case "failed":
@@ -794,6 +924,12 @@ type request struct {
 	DedupeKey  string     `json:"dedupe_key,omitempty"`
 }
 
+type declinedRequest struct {
+	WebsiteID  string     `json:"website_id"`
+	Token      string     `json:"token"`
+	OccurredAt *time.Time `json:"occurred_at,omitempty"`
+}
+
 type response struct {
 	Status  Status `json:"status"`
 	Code    string `json:"code"`
@@ -809,7 +945,7 @@ func (c *Client) post(ctx context.Context, path string, body []byte) (Status, er
 	defer cancel()
 	deadline, _ := ctx.Deadline()
 	url := strings.TrimRight(c.BaseURL, "/") + path
-	retries := max(c.Retries, 0) // negative means no retries, never no attempt
+	retries := min(max(c.Retries, 0), 10) // negative means no retries, never no attempt
 	var last *Error
 	for i := 0; i <= retries; i++ {
 		if i > 0 {
@@ -928,4 +1064,10 @@ func orInt(v, fallback int) int {
 		return fallback
 	}
 	return v
+}
+
+func trimSpace(s string) string {
+	return strings.TrimFunc(s, func(r rune) bool {
+		return r == '\uFEFF' || unicode.IsSpace(r)
+	})
 }
