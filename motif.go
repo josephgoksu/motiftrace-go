@@ -98,7 +98,7 @@ type Signup struct {
 	OptedOut bool
 	// Declined is true when the user declined analytics and you still want
 	// the signup counted. The user id never leaves your server: Motif gets
-	// only that a signup happened on CreatedAt's day, plus a retry token
+	// only that a signup happened at CreatedAt, plus a retry token
 	// (HMAC-SHA256 of the user id under your ingest key) that it clears after
 	// 48 hours. Sent only within 24 hours of CreatedAt, so a signup counts on
 	// its day; the Overview estimates its channel from your tracked signups.
@@ -229,6 +229,8 @@ const (
 	signupEvent    = "signup_completed"
 	milestonesPath = "/v1/milestones"
 	declinedPath   = "/v1/milestones/declined"
+	// declinedSuffix turns a user's signup key into their declined count's key.
+	declinedSuffix = "\x00declined"
 	// declinedWindow is how long after CreatedAt a declined signup is sent.
 	// Motif keeps its retry token 48 hours, so a later resend could count twice.
 	declinedWindow  = 24 * time.Hour
@@ -420,6 +422,10 @@ func (c *Client) signupLocked(s Signup, now time.Time) (Decision, job) {
 	if s.Declined {
 		return c.declinedLocked(s, site, user, key, now)
 	}
+	// Counted already as declined (they accepted after declining): not again.
+	if c.countedLocked(key + declinedSuffix) {
+		return Known, job{}
+	}
 	if d := c.seenLocked(key, now); d != "" {
 		return d, job{}
 	}
@@ -428,22 +434,39 @@ func (c *Client) signupLocked(s Signup, now time.Time) (Decision, job) {
 }
 
 // declinedLocked queues the anonymous count for a user who declined. A user
-// this process already sent with their id (they declined after signing up)
-// is not counted again.
+// this process already queued or sent with their id (they declined after
+// signing up) is not counted again.
 func (c *Client) declinedLocked(s Signup, site, user, signupKey string, now time.Time) (Decision, job) {
 	if now.Sub(s.CreatedAt) > declinedWindow {
 		return TooOld, job{}
 	}
-	if el, ok := c.cache[signupKey]; ok && el.Value.(*entry).ok {
+	if c.countedLocked(signupKey) {
 		return Known, job{}
 	}
-	key := signupKey + "\x00declined"
+	key := signupKey + declinedSuffix
 	if d := c.seenLocked(key, now); d != "" {
 		return d, job{}
 	}
-	at := s.CreatedAt.UTC()
+	// A CreatedAt ahead of this clock would be refused past Motif's skew
+	// allowance; an event never lands in the future.
+	at := s.CreatedAt
+	if at.After(now) {
+		at = now
+	}
+	at = at.UTC()
 	body, _ := json.Marshal(declinedRequest{WebsiteID: site, Token: declinedToken(c.apiKey, site, user), OccurredAt: &at})
 	return Queued, job{kind: "declined", key: key, path: declinedPath, websiteID: site, userID: user, name: signupEvent, body: body}
+}
+
+// countedLocked reports whether key is queued or acknowledged, so the same
+// user's signup in the other form (with their id, or declined) is not counted
+// a second time.
+func (c *Client) countedLocked(key string) bool {
+	if c.inQueue[key] {
+		return true
+	}
+	el, ok := c.cache[key]
+	return ok && el.Value.(*entry).ok
 }
 
 // seenLocked answers Known or Backoff for a key that is queued or remembered,
@@ -610,7 +633,7 @@ func backfillJob(apiKey, key, site, user string, u Signup) job {
 	if u.Declined {
 		at := u.CreatedAt.UTC()
 		body, _ := json.Marshal(declinedRequest{WebsiteID: site, Token: declinedToken(apiKey, site, user), OccurredAt: &at})
-		return job{kind: "backfill", key: key + "\x00declined", path: declinedPath, websiteID: site, userID: user, name: signupEvent, body: body, done: make(chan Result, 1)}
+		return job{kind: "backfill", key: key + declinedSuffix, path: declinedPath, websiteID: site, userID: user, name: signupEvent, body: body, done: make(chan Result, 1)}
 	}
 	body, _ := json.Marshal(request{WebsiteID: site, UserID: user, EventName: signupEvent, OccurredAt: utcOrNil(u.CreatedAt)})
 	return job{kind: "backfill", key: key, path: milestonesPath, websiteID: site, userID: user, name: signupEvent, body: body, done: make(chan Result, 1)}

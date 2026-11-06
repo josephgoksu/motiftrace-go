@@ -769,3 +769,61 @@ func TestBackfillSendsDeclinedUsersAsCounts(t *testing.T) {
 		t.Fatalf("declined body %v", rec.bodies[0])
 	}
 }
+
+// A user counted as declined who accepts afterwards is not counted a second
+// time with their id, and a declined call while the identified send is still
+// queued is not counted either.
+func TestSignupCountsAUserOnceAcrossDeclinedAndIdentified(t *testing.T) {
+	rec := &recorder{}
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock() // a failed check must not leave the server's handler waiting
+	srv := rec.serve(t, func(n int, w http.ResponseWriter) {
+		if n == 2 {
+			<-release
+		}
+		_, _ = w.Write([]byte(`{"status":"counted"}`))
+	})
+	c := client(t, srv.URL, Config{})
+	created := time.Now().Add(-time.Minute)
+	c.Signup(Signup{UserID: "d1", CreatedAt: created, Declined: true})
+	flush(t, c)
+	if d := c.Signup(Signup{UserID: "d1", CreatedAt: created}); d != Known {
+		t.Fatalf("identified after declined %s", d)
+	}
+	if d := c.Signup(Signup{UserID: "i1", CreatedAt: created}); d != Queued {
+		t.Fatalf("identified %s", d)
+	}
+	if d := c.Signup(Signup{UserID: "i1", CreatedAt: created, Declined: true}); d != Known {
+		t.Fatalf("declined while the identified send is queued %s", d)
+	}
+	unblock()
+	flush(t, c)
+	if rec.count() != 2 {
+		t.Fatalf("requests %d", rec.count())
+	}
+}
+
+// A CreatedAt ahead of this clock is sent as now, never as a future time
+// Motif would refuse.
+func TestSignupDeclinedClampsAFutureCreatedAt(t *testing.T) {
+	rec := &recorder{}
+	srv := rec.serve(t, func(_ int, w http.ResponseWriter) { _, _ = w.Write([]byte(`{"status":"counted"}`)) })
+	c := client(t, srv.URL, Config{})
+	before := time.Now()
+	c.Signup(Signup{UserID: "u1", CreatedAt: before.Add(time.Hour), Declined: true})
+	flush(t, c)
+	at, err := time.Parse(time.RFC3339Nano, rec.bodies[0]["occurred_at"].(string))
+	if err != nil || at.After(time.Now()) || at.Before(before) {
+		t.Fatalf("occurred_at %v (err %v)", rec.bodies[0]["occurred_at"], err)
+	}
+}
+
+// sdk/test/server.test.ts pins the same vector, so both SDKs drop each
+// other's retries.
+func TestDeclinedTokenMatchesTheTSSDK(t *testing.T) {
+	if got := declinedToken("k", "s", "u"); got != "773396da09413482392765e80c768e96a0319c223c988ec4a2c38ae83ed9ab06" {
+		t.Fatalf("token %s", got)
+	}
+}
