@@ -827,3 +827,64 @@ func TestDeclinedTokenMatchesTheTSSDK(t *testing.T) {
 		t.Fatalf("token %s", got)
 	}
 }
+
+func TestBackfillDedupesAgainstSignupAcrossDeclinedIdentifiedAndQueued(t *testing.T) {
+	rec := &recorder{}
+	release := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	defer unblock()
+	srv := rec.serve(t, func(n int, w http.ResponseWriter) {
+		if n == 3 {
+			<-release
+		}
+		_, _ = w.Write([]byte(`{"status":"counted"}`))
+	})
+	c := client(t, srv.URL, Config{BackfillRate: 1000})
+	created := time.Now().Add(-time.Minute).Truncate(time.Second)
+
+	if d := c.Signup(Signup{UserID: "u-declined", CreatedAt: created, Declined: true}); d != Queued {
+		t.Fatalf("declined signup %s", d)
+	}
+	if d := c.Signup(Signup{UserID: "u-identified", CreatedAt: created}); d != Queued {
+		t.Fatalf("identified signup %s", d)
+	}
+	flush(t, c)
+
+	if d := c.Signup(Signup{UserID: "u-inflight", CreatedAt: created}); d != Queued {
+		t.Fatalf("inflight signup %s", d)
+	}
+
+	repCh := make(chan BackfillReport, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		rep, err := c.Backfill(context.Background(), []Signup{
+			{UserID: "u-declined", CreatedAt: created},
+			{UserID: "u-identified", CreatedAt: created, Declined: true},
+			{UserID: "u-inflight", CreatedAt: created, Declined: true},
+		})
+		repCh <- rep
+		errCh <- err
+	}()
+
+	select {
+	case rep := <-repCh:
+		if err := <-errCh; err != nil {
+			t.Fatalf("Backfill err %v", err)
+		}
+		unblock()
+		flush(t, c)
+		if rep.Eligible != 3 || rep.Duplicate != 3 || rep.Sent.Counted != 0 || rep.Sent.Pending != 0 || rep.Sent.Attached != 0 {
+			t.Fatalf("Backfill report = %+v, want 3 duplicates and 0 sent", rep)
+		}
+		if rec.count() != 3 {
+			t.Fatalf("requests = %d, want 3", rec.count())
+		}
+	case <-time.After(300 * time.Millisecond):
+		unblock()
+		rep := <-repCh
+		_ = <-errCh
+		flush(t, c)
+		t.Fatalf("Backfill blocked on queued signup or double-sent: rep=%+v requests=%d", rep, rec.count())
+	}
+}
