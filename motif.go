@@ -423,7 +423,7 @@ func (c *Client) signupLocked(s Signup, now time.Time) (Decision, job) {
 		return c.declinedLocked(s, site, user, key, now)
 	}
 	// Counted already as declined (they accepted after declining): not again.
-	if c.countedLocked(key + declinedSuffix) {
+	if c.countedLocked(key+declinedSuffix, now) {
 		return Known, job{}
 	}
 	if d := c.seenLocked(key, now); d != "" {
@@ -440,7 +440,7 @@ func (c *Client) declinedLocked(s Signup, site, user, signupKey string, now time
 	if now.Sub(s.CreatedAt) > declinedWindow {
 		return TooOld, job{}
 	}
-	if c.countedLocked(signupKey) {
+	if c.countedLocked(signupKey, now) {
 		return Known, job{}
 	}
 	key := signupKey + declinedSuffix
@@ -461,12 +461,16 @@ func (c *Client) declinedLocked(s Signup, site, user, signupKey string, now time
 // countedLocked reports whether key is queued or acknowledged, so the same
 // user's signup in the other form (with their id, or declined) is not counted
 // a second time.
-func (c *Client) countedLocked(key string) bool {
+func (c *Client) countedLocked(key string, now time.Time) bool {
 	if c.inQueue[key] {
 		return true
 	}
 	el, ok := c.cache[key]
-	return ok && el.Value.(*entry).ok
+	if !ok {
+		return false
+	}
+	e := el.Value.(*entry)
+	return e.ok && now.Before(e.until)
 }
 
 // seenLocked answers Known or Backoff for a key that is queued or remembered,
@@ -673,11 +677,11 @@ func (c *Client) sendBackfill(ctx context.Context, j job, wait time.Duration) (R
 			c.report(res)
 			return res, nil
 		}
-		if el, ok := c.cache[key]; ok {
-			if e := el.Value.(*entry); e.ok && time.Now().Before(e.until) {
-				c.mu.Unlock()
-				return Result{Outcome: string(Duplicate)}, nil
-			}
+		baseKey := strings.TrimSuffix(key, declinedSuffix)
+		now := time.Now()
+		if c.countedLocked(baseKey, now) || c.countedLocked(baseKey+declinedSuffix, now) {
+			c.mu.Unlock()
+			return Result{Outcome: string(Duplicate)}, nil
 		}
 		// Wait for room rather than drop: live Signup sends keep their place.
 		if paced && len(c.queue) < c.queueSize {
